@@ -168,6 +168,12 @@ uvgrtp::rtcp_app_packet::~rtcp_app_packet() {
 
 void uvgrtp::rtcp::free_participant(std::unique_ptr<rtcp_participant> participant)
 {
+    if (!participant)
+    {
+        return;  // defensive: every caller should already guarantee this, but a
+                 // null unique_ptr here (e.g. from a map's operator[] silently
+                 // inserting one for a missing key) previously segfaulted below.
+    }
     if (participant->sr_frame)
     {
         delete participant->sr_frame;
@@ -1534,10 +1540,24 @@ rtp_error_t uvgrtp::rtcp::handle_bye_packet(uint8_t* packet, size_t& read_ptr,
         UVG_LOG_DEBUG("Destroying participant with BYE");
 
         participants_mutex_.lock();
-        free_participant(std::move(participants_[ssrc]));
+        auto it = participants_.find(ssrc);
+        if (it == participants_.end() || !it->second)
+        {
+            participants_mutex_.unlock();
+            continue;  // already removed by a concurrent path (e.g. remove_timeout_ssrc)
+        }
+        free_participant(std::move(it->second));
         participants_.erase(ssrc);
         ms_since_last_rep_.erase(ssrc);
         participants_mutex_.unlock();
+
+        // See remove_timeout_ssrc for why this matters: never decrementing
+        // num_receivers_ meant add_participant would permanently refuse
+        // new participants once enough total add/remove churn happened
+        // over a session's lifetime.
+        if (num_receivers_ >= 1) {
+            num_receivers_--;
+        }
     }
     // TODO: RFC3550 6.2.1: add a delay for deleting the member. This way if straggler packets
     // are received after deletion, deleted member wont be recreated
@@ -2116,8 +2136,37 @@ void uvgrtp::rtcp::set_session_bandwidth(uint32_t kbps)
 rtp_error_t uvgrtp::rtcp::remove_timeout_ssrc(uint32_t ssrc)
 {
     UVG_LOG_INFO("Destroying timed out source, ssrc: %lu", ssrc);
-    free_participant(std::move(participants_[ssrc]));
+
+    // participants_mutex_ guards every other mutator of participants_
+    // (add_participant, handle_bye_packet, cleanup_participants) -- this
+    // one (called from the separate rtcp_runner maintenance thread) was
+    // missing it, a real race against those other threads that could
+    // corrupt participants_ (observed directly: a long adaptive-bitrate
+    // run with frequent participant timeout/rejoin cycles under real
+    // jitter/loss segfaulted here, in free_participant, after
+    // participants_[ssrc] via operator[] silently inserted a null entry
+    // for an ssrc some other thread had already erased).
+    participants_mutex_.lock();
+    auto it = participants_.find(ssrc);
+    if (it == participants_.end() || !it->second)
+    {
+        participants_mutex_.unlock();
+        return RTP_OK;  // already removed by a concurrent path -- nothing to do
+    }
+    free_participant(std::move(it->second));
     participants_.erase(ssrc);
+    participants_mutex_.unlock();
+
+    // num_receivers_ (unlike members_) was never decremented anywhere on
+    // removal -- see add_participant, which refuses any new participant
+    // once this hits MAX_SUPPORTED_PARTICIPANTS, permanently, after
+    // enough total add/remove churn over a session's lifetime (not just
+    // concurrently-active count). A link with frequent timeout/rejoin
+    // cycles (e.g. real jitter/loss intermittently missing several
+    // reports in a row) hit this within one session.
+    if (num_receivers_ >= 1) {
+        num_receivers_--;
+    }
 
     if (members_ >= 1) {
         members_ -= 1;

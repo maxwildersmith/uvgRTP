@@ -575,8 +575,16 @@ size_t uvgrtp::formats::h26x::drop_access_unit(uint32_t ts)
 
     for (auto& fragment_seq : access_units_[ts].incomplete_packet_seqs)
     {
-        total_cleaned += fragments_[fragment_seq]->payload_len + sizeof(uvgrtp::frame::rtp_frame);
-        free_fragment(fragment_seq);
+        // Use find() instead of operator[]: a seq not actually present in
+        // fragments_ (shouldn't happen once reconstruction()/packet_handler
+        // above only track truly-received fragments in incomplete_packet_seqs,
+        // but stay defensive) must not silently insert a null entry nor
+        // dereference a null pointer here.
+        auto it = fragments_.find(fragment_seq);
+        if (it != fragments_.end() && it->second != nullptr) {
+            total_cleaned += it->second->payload_len + sizeof(uvgrtp::frame::rtp_frame);
+            free_fragment(fragment_seq);
+        }
     }
 
     dropped_ts_[ts] = access_units_.at(ts).sframe_time;
@@ -677,8 +685,8 @@ rtp_error_t uvgrtp::formats::h26x::packet_handler(void* args, int rce_flags, uin
     }
 
     // aggregate, start, middle, end or single NAL
-    uvgrtp::formats::FRAG_TYPE frag_type = get_fragment_type(frame); 
-    
+    uvgrtp::formats::FRAG_TYPE frag_type = get_fragment_type(frame);
+
     // first we check that this packet does not belong to an access unit that has been dropped by garbage collection
     if (dropped_ts_.find(frame->header.timestamp) != dropped_ts_.end()) {
         UVG_LOG_DEBUG("Received an RTP packet belonging to an old, dropped access unit! Timestamp: %u, seq: %u",
@@ -821,33 +829,70 @@ rtp_error_t uvgrtp::formats::h26x::packet_handler(void* args, int rce_flags, uin
 
         /* A continuous set of fragments with a start and end has been found. NAL unit can be reconstructed */
         if (is_end) {
-            size_t nal_size = 0; // Find size of the complete reconstructed NAL unit       
+            // Verify every fragment this run needs is still actually
+            // present before touching any of them. fragments_ is a
+            // std::unordered_map<uint16_t, rtp_frame*>; operator[] on a
+            // missing key silently inserts a null entry, and the
+            // previous code below dereferenced fragments_[p]->payload_len
+            // unconditionally -- a reliably reproducible segfault under
+            // sustained packet loss with real H264 content, once a
+            // fragment in this run had already been freed (e.g. by an
+            // earlier reconstruction attempt over an overlapping range).
+            bool run_intact = true;
             for (auto p : reconstructed_fragments.at(start_seq).seqs) {
-                nal_size += (fragments_[p]->payload_len - sizeof_fu_headers);
-                au.fragments_info[p].reconstructed = true;
-            }
-
-            /* Work in progress feature: here we discard inter frames if their references were not received correctly */
-            bool enable_reference_discarding = (rce_flags & RCE_H26X_DEPENDENCY_ENFORCEMENT);
-            if (discard_until_key_frame_ && enable_reference_discarding) {
-                if (nal_type == uvgrtp::formats::NAL_TYPE::NT_INTER) {
-                    UVG_LOG_WARN("Dropping h26x access unit because of missing reference. Timestamp: %lu. Seq: %u - %u",
-                        fragment_ts, *access_units_[fragment_ts].received_packet_seqs.begin(), 
-                        *access_units_[fragment_ts].received_packet_seqs.rbegin());
-
-                    drop_access_unit(fragment_ts);
-                    return RTP_GENERIC_ERROR;
-                }
-                else if (nal_type == uvgrtp::formats::NAL_TYPE::NT_INTRA) {
-
-                    // we don't have to discard anymore
-                    UVG_LOG_INFO("Found a key frame at ts %lu", fragment_ts);
-                    discard_until_key_frame_ = false;
+                auto it = fragments_.find(p);
+                if (it == fragments_.end() || it->second == nullptr) {
+                    run_intact = false;
+                    break;
                 }
             }
-            if ((reconstruction(out, nal_size, rce_flags, start_seq, current_fragment, sizeof_fu_headers)) == RTP_PKT_READY) {
-                ret = RTP_PKT_READY;
+
+            if (run_intact) {
+                size_t nal_size = 0; // Find size of the complete reconstructed NAL unit
+                for (auto p : reconstructed_fragments.at(start_seq).seqs) {
+                    nal_size += (fragments_[p]->payload_len - sizeof_fu_headers);
+                    au.fragments_info[p].reconstructed = true;
+                }
+
+                /* Work in progress feature: here we discard inter frames if their references were not received correctly */
+                bool enable_reference_discarding = (rce_flags & RCE_H26X_DEPENDENCY_ENFORCEMENT);
+                if (discard_until_key_frame_ && enable_reference_discarding) {
+                    if (nal_type == uvgrtp::formats::NAL_TYPE::NT_INTER) {
+                        UVG_LOG_WARN("Dropping h26x access unit because of missing reference. Timestamp: %lu. Seq: %u - %u",
+                            fragment_ts, *access_units_[fragment_ts].received_packet_seqs.begin(),
+                            *access_units_[fragment_ts].received_packet_seqs.rbegin());
+
+                        drop_access_unit(fragment_ts);
+                        return RTP_GENERIC_ERROR;
+                    }
+                    else if (nal_type == uvgrtp::formats::NAL_TYPE::NT_INTRA) {
+
+                        // we don't have to discard anymore
+                        UVG_LOG_INFO("Found a key frame at ts %lu", fragment_ts);
+                        discard_until_key_frame_ = false;
+                    }
+                }
+                if ((reconstruction(out, nal_size, rce_flags, start_seq, current_fragment, sizeof_fu_headers)) == RTP_PKT_READY) {
+                    ret = RTP_PKT_READY;
+                }
             }
+            else {
+                UVG_LOG_DEBUG("h26x reconstruction: a fragment in seq range %u - %u vanished before use, dropping this run",
+                    start_seq, current_fragment);
+                // Free whatever in this run is still actually allocated --
+                // this run is unrecoverable and is being dropped from
+                // incomplete_packet_seqs below regardless, so nothing else
+                // (drop_access_unit/GC included) will ever free these again.
+                for (auto p : reconstructed_fragments.at(start_seq).seqs) {
+                    auto it = fragments_.find(p);
+                    if (it != fragments_.end() && it->second != nullptr) {
+                        free_fragment(p);
+                    }
+                }
+            }
+            // Either reconstructed or unrecoverable -- this run is done,
+            // so erase it from incomplete_packet_seqs below so it isn't
+            // walked and retried again on the next packet for this ts.
             reconstructed_fragments.at(start_seq).complete = true;
         }
 
@@ -1012,20 +1057,30 @@ rtp_error_t uvgrtp::formats::h26x::reconstruction(uvgrtp::frame::rtp_frame** out
     uint16_t next_from_last = uint16_t(next_seq_num(e_seq));
     for (uint16_t i = s_seq; i != next_from_last; ++i)
     {
-        if (fragments_[i] == nullptr)
+        // find() rather than operator[]: a missing seq must not silently
+        // insert a null entry into fragments_ -- that phantom entry would
+        // sit in the map (untracked by any access unit's
+        // incomplete_packet_seqs) until the 16-bit seq space wrapped
+        // around and collided with an unrelated future fragment.
+        auto it = fragments_.find(i);
+        if (it == fragments_.end() || it->second == nullptr)
         {
             UVG_LOG_ERROR("Missing fragment in reconstruction. Seq range: %u - %u. Missing seq %u",
                 s_seq, e_seq, i);
+            // `complete` was already allocated above for this attempt --
+            // free it here instead of leaking it, since *out/caller never
+            // takes ownership on this early-return path.
+            (void)uvgrtp::frame::dealloc_frame(complete);
             return RTP_GENERIC_ERROR;
         }
 
         // copy everything expect fu headers (which repeat for every fu)
         std::memcpy(
             &complete->payload[fptr],
-            &fragments_[i]->payload[sizeof_fu_headers],
-            fragments_[i]->payload_len - sizeof_fu_headers
+            &it->second->payload[sizeof_fu_headers],
+            it->second->payload_len - sizeof_fu_headers
         );
-        fptr += fragments_[i]->payload_len - sizeof_fu_headers;
+        fptr += it->second->payload_len - sizeof_fu_headers;
         free_fragment(i);
     }
 
@@ -1036,7 +1091,28 @@ rtp_error_t uvgrtp::formats::h26x::reconstruction(uvgrtp::frame::rtp_frame** out
 
 uint16_t uvgrtp::formats::h26x::nextSeq(uint16_t currentSeq, std::set<uint16_t>& fragments)
 {
+    // currentSeq is expected to always be a member of `fragments` (the
+    // caller only ever passes in either start_seq, which was just found
+    // by iterating `fragments`, or a value nextSeq itself returned on a
+    // previous call). Under sustained packet loss, however, state
+    // elsewhere (see the h26x.cc "complete" fix above) could leave
+    // `fragments` missing an entry the caller still expects to find --
+    // fragments.find() then returns end(), and dereferencing it (the
+    // previous behavior here) is undefined behavior that manifested as
+    // a segfault. Fail safe instead: treat "not found" the same as "no
+    // next fragment exists yet" by returning currentSeq unchanged, which
+    // the caller's `while (current_fragment != start_seq)` /
+    // `if (current_fragment != next_seq) break;` checks already handle
+    // as "stop, nothing more to reconstruct right now".
+    if (fragments.empty()) {
+        return currentSeq;
+    }
+
     auto currentIterator = fragments.find(currentSeq);
+    if (currentIterator == fragments.end())
+    {
+        return currentSeq;
+    }
 
     if (*currentIterator == *(fragments.rbegin()))
     {
