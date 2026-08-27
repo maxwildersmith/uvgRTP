@@ -22,6 +22,8 @@
 #include <netinet/in.h>
 #include <cassert>
 #include <cstring>
+
+#include "uvgrtp/debug_counters.hh"   /* DEBUG-ONLY, see header */
 #endif
 
 
@@ -55,6 +57,7 @@ rtp_error_t uvgrtp::frame_queue::init_transaction(bool use_old_rtp_ts)
     }
 
     active_      = new transaction_t;
+    uvgrtp::debug::transactions_allocated().fetch_add(1, std::memory_order_relaxed);
 
 #ifndef _WIN32
     active_->headers     = new struct mmsghdr[max_mcount_];
@@ -159,6 +162,7 @@ rtp_error_t uvgrtp::frame_queue::deinit_transaction()
     for (unsigned int i = 0; i < active_->tmp.size(); ++i)
     {
         delete[] active_->tmp[i];
+        uvgrtp::debug::tmp_buffers_freed().fetch_add(1, std::memory_order_relaxed);
     }
 
     active_->tmp.clear();
@@ -197,6 +201,7 @@ rtp_error_t uvgrtp::frame_queue::deinit_transaction()
     }
 
     delete active_;
+    uvgrtp::debug::transactions_freed().fetch_add(1, std::memory_order_relaxed);
     active_ = nullptr;
 
     return RTP_OK;
@@ -277,6 +282,7 @@ rtp_error_t uvgrtp::frame_queue::enqueue_message(buf_vec& buffers)
 
         tmp.push_back({ total, mem });
         active_->tmp.push_back(mem);
+        uvgrtp::debug::tmp_buffers_allocated().fetch_add(1, std::memory_order_relaxed);
 
     } else {
         for (auto& buffer : buffers) {
