@@ -1089,7 +1089,23 @@ rtp_error_t uvgrtp::rtcp::recv_packet_handler_common(void *arg, int rce_flags, u
         }
     } else if ((ret = rtcp->update_participant_seq(frame->header.ssrc, frame->header.seq)) != RTP_OK) {
         if (ret == RTP_NOT_READY) {
-            return RTP_OK;
+            /* Source is still on probation (MIN_SEQUENTIAL packets, RFC 3550
+             * A.1). Its STATISTICS are not yet valid -- that is what the early
+             * return is for -- but the packet itself is still media that has a
+             * destination, so it must be passed on exactly as the normal path
+             * below does.
+             *
+             * Returning RTP_OK here instead meant reception_flow.cc's
+             *     if (retval == RTP_PKT_MODIFIED || retval == RTP_PKT_NOT_HANDLED)
+             * gate skipped the media handler, silently DISCARDING the first
+             * packets of every new stream. For a low-rate generic stream that
+             * costs one message. For H264 it costs the SPS/PPS/IDR, and every
+             * subsequent P-frame depends on it, so the stream never decodes at
+             * all until the next keyframe: measured 0/8 frames decoded at
+             * gop_size=30 (one IDR) versus 36/40 at gop_size=4 (many IDRs).
+             * That was the cause of "no frames decoded back at all" whenever
+             * RTCP was enabled -- i.e. whenever eval metrics were on. */
+            return RTP_PKT_NOT_HANDLED;
         }
         else {
             UVG_LOG_ERROR("Failed to update participant with seq %u", frame->header.seq);
