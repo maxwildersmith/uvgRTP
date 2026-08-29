@@ -1,4 +1,7 @@
-#if defined(__MINGW32__) || defined(__MINGW64__)
+/* See the matching guard in socket.cc: unused when the target is Vista or
+ * later, where ws2tcpip.h supplies a real inet_pton. */
+#if (defined(__MINGW32__) || defined(__MINGW64__)) \
+    && (!defined(_WIN32_WINNT) || _WIN32_WINNT < 0x0600)
 #include "mingw_inet.hh"
 
 #include <cstdint>
@@ -52,7 +55,7 @@ static int inet_pton4(const char *src, struct in_addr *dst)
     return 1;
 }
 
-int inet_pton6(const char *src, struct in_addr *dst)
+int inet_pton6(const char *src, void *dst)
 {
     static const char xdigits[] = "0123456789abcdef";
     uint8_t tmp[NS_IN6ADDRSZ];
@@ -146,11 +149,11 @@ int inet_pton6(const char *src, struct in_addr *dst)
     return 1;
 }
 
-int uvgrtp::mingw::inet_pton(int af, const char *src, struct in_addr *dst)
+int uvgrtp::mingw::inet_pton(int af, const char *src, void *dst)
 {
     switch (af) {
         case AF_INET:
-            return inet_pton4(src, dst);
+            return inet_pton4(src, (struct in_addr *)dst);
         case AF_INET6:
             return inet_pton6(src, dst);
         default:

@@ -22,9 +22,13 @@
 #include <netinet/in.h>
 #include <cassert>
 #include <cstring>
-
-#include "uvgrtp/debug_counters.hh"   /* DEBUG-ONLY, see header */
 #endif
+
+/* DEBUG-ONLY, see header. Outside the _WIN32/#else split on purpose: the
+ * counters below are incremented unconditionally, so having the include only in
+ * the non-Windows branch broke the mingw cross build with
+ * "'uvgrtp::debug' has not been declared". */
+#include "uvgrtp/debug_counters.hh"
 
 
 uvgrtp::frame_queue::frame_queue(std::shared_ptr<uvgrtp::socket> socket, std::shared_ptr<uvgrtp::rtp> rtp, int rce_flags):

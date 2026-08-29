@@ -23,7 +23,12 @@
 #include <netdb.h>
 #endif
 
-#if defined(__MINGW32__) || defined(__MINGW64__)
+/* Only for a pre-Vista target. mingw-w64's ws2tcpip.h declares a real
+ * inet_pton when _WIN32_WINNT >= 0x0600, and pulling the local shim into scope
+ * as well made every call ambiguous rather than merely redundant. Kept behind
+ * the version check so an old target still builds. */
+#if (defined(__MINGW32__) || defined(__MINGW64__)) \
+    && (!defined(_WIN32_WINNT) || _WIN32_WINNT < 0x0600)
 #include "mingw_inet.hh"
 using namespace uvgrtp;
 using namespace mingw;
