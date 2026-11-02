@@ -6,6 +6,8 @@
 #include "socketfactory.hh"
 #include "crypto.hh"
 #include "zrtp.hh"
+
+#include <algorithm>
 #include "debug.hh"
 
 namespace uvgrtp {
